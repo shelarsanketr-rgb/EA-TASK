@@ -1,519 +1,131 @@
-// Sanket EA Task Tracker v3.4 (single file). v3.4: GitHub page ab JSONP (script tag) se judta hai - 'Failed to fetch' ka ilaaj. v3.3: Laal URGENT kaam sabse upar. v3.2: GitHub page (asli mic + apne aap text) is script se doPost API dwara judta hai. v3.1: Mic button tab/phone ka apna recorder kholta hai (jahan Apps Script mic rokta hai). v3.0: Done kaam niche + 24 ghante baad 'Done work' tab me; High + due/overdue kaam laal flash. v2.9: Mic button in Add task (bolkar Task likhna + aawaz Drive me save + dashboard par play).
-var CONFIG = {
-  TITLE: 'Sanket – EA Tasks',
-  TZ: 'Asia/Kolkata',
-  DONE_PIN: '0003',
-  GIVERS: ['Sanket', 'EA'],
-  PRIOS: ['High', 'Normal', 'Low'],
-  SHOW_DONE_DAYS: 2,
-  DONE_HIDE_HOURS: 24,        // Done (PIN) kaam itne ghante baad Active se hatkar 'Done work' tab me jayega
-  DONE_TAB_MAX: 300,          // 'Done work' tab me kitne purane kaam dikhein
-  ORANGE: '#E8731C',
-  MIC_MODE: 'recorder',        // 'recorder' = tab/phone ka apna recorder khulega (har device par chalta hai); 'live' = page ke andar mic + apne aap text
-  MIC_LANG: 'mr-IN',          // bolne ki bhasha: 'mr-IN' (Marathi) ya 'hi-IN' (Hindi)
-  SAVE_VOICE: true,           // true = aawaz Drive me save hogi; agar text na aaye to false karke dekhein
-  VOICE_FOLDER: 'EA Task Voice'
-};
-var SH_TASKS = 'Tasks', SH_SCORE = 'Score', SH_LOG = 'Log';
-var COLS = 14;
-var HEAD = ['Given on','Given by','Task','Due date','Priority','Updates (EA)','Done','Done on','Result','No. of updates','Someday','Someday on','Completed on','Voice'];
-
-function onOpen(){
-  SpreadsheetApp.getUi().createMenu('Sanket Tasks')
-    .addItem('Setup / repair sheets', 'setup')
-    .addItem('Refresh score', 'refreshScore')
-    .addItem('Show dashboard link', 'showLink')
-    .addToUi();
-}
-function setup(){
-  var ss = SpreadsheetApp.getActive();
-  var t = ss.getSheetByName(SH_TASKS) || ss.insertSheet(SH_TASKS, 0);
-  t.getRange(1,1,1,COLS).setValues([HEAD]).setFontWeight('bold').setFontColor('#ffffff').setBackground(CONFIG.ORANGE).setWrap(true);
-  t.setFrozenRows(1);
-  [110,90,320,100,80,380,60,130,80,90,80,130,130,200].forEach(function(w,i){ t.setColumnWidth(i+1,w); });
-  t.getRange('A2:A').setNumberFormat('dd-MM-yyyy');
-  t.getRange('D2:D').setNumberFormat('dd-MM-yyyy');
-  t.getRange('H2:H').setNumberFormat('dd-MM-yyyy HH:mm');
-  t.getRange('L2:L').setNumberFormat('dd-MM-yyyy HH:mm');
-  t.getRange('M2:M').setNumberFormat('dd-MM-yyyy HH:mm');
-  t.getRange('F2:F').setWrap(true).setVerticalAlignment('top');
-  var lg = ss.getSheetByName(SH_LOG) || ss.insertSheet(SH_LOG);
-  if (lg.getLastRow() < 1) lg.appendRow(['Time','Action','Task','By']);
-  lg.getRange(1,1,1,4).setFontWeight('bold').setBackground('#FCE3CF');
-  var sc = ss.getSheetByName(SH_SCORE) || ss.insertSheet(SH_SCORE, 1);
-  var d1 = ss.getSheetByName('Sheet1'); if (d1 && ss.getSheets().length > 3 && d1.getLastRow() === 0) ss.deleteSheet(d1);
-  ss.setSpreadsheetTimeZone(CONFIG.TZ);
-  if (t.getLastColumn() < COLS){
-    var start = t.getLastColumn()+1;
-    t.getRange(1, start, 1, COLS - start + 1).setValues([HEAD.slice(start-1)]).setFontWeight('bold').setFontColor('#ffffff').setBackground(CONFIG.ORANGE);
-    var lr = t.getLastRow();
-    if (lr >= 2 && start <= 12){ t.getRange(2, 11, lr-1, 1).insertCheckboxes(); t.getRange(2, 12, lr-1, 1).setNumberFormat('dd-MM-yyyy HH:mm'); t.getRange(2, 13, lr-1, 1).setNumberFormat('dd-MM-yyyy HH:mm'); }
-  }
-  refreshScore();
-  try { SpreadsheetApp.getUi().alert('Setup done.'); } catch(e){}
-}
-function showLink(){
-  var u = ''; try { u = ScriptApp.getService().getUrl(); } catch(e){}
-  if (!u){ SpreadsheetApp.getUi().alert('Not deployed yet. Deploy -> New deployment -> Web app.'); return; }
-  SpreadsheetApp.getUi().alert('Dashboard link:\n' + u +
-    '\n\n--- GitHub page (mic wala) setup ---\nScript link:\n' + u + '\n\nPasscode:  ' + getApiKey_() +
-    '\n\nEA ke liye ek-click link: apne GitHub page link ke aage ye jodkar bhejiye:\n#u=' + encodeURIComponent(u) + '&k=' + getApiKey_());
-}
-function getApiKey_(){
-  var pr = PropertiesService.getScriptProperties(), k = pr.getProperty('API_KEY');
-  if (!k){ k = String(Math.floor(10000000 + Math.random()*89999999)); pr.setProperty('API_KEY', k); }
-  return k;
-}
-// GitHub page isi se baat karta hai (JSON). Deployment "Who has access: Anyone" hona chahiye.
-var API_FUNCS = { getData:getData, addTask:addTask, addBulk:addBulk, updateTask:updateTask, doneTask:doneTask,
-  completedTask:completedTask, somedayTask:somedayTask, toLiveTask:toLiveTask, getVoice:getVoice };
-function apiOut_(p, out){
-  var cb = String(p.cb || '');
-  var txt = JSON.stringify(out);
-  if (/^[A-Za-z_$][\w$]{0,60}$/.test(cb)) return ContentService.createTextOutput(cb + '(' + txt + ');').setMimeType(ContentService.MimeType.JAVASCRIPT);
-  return ContentService.createTextOutput(txt).setMimeType(ContentService.MimeType.JSON);
-}
-// GitHub page: <script src=".../exec?fn=getData&k=PASS&cb=..."> (JSONP). Bade args pehle doPost se 'stash' hote hain.
-function apiGet_(p){
-  var out;
+<!-- Sanket EA Tasks - GitHub page (mic). Isse badalne ki zarurat nahi; setup page par hota hai. -->
+<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#E8731C">
+<title>Sanket – EA Tasks</title>
+<script>
+/* GitHub page -> Apps Script bridge. Script link aur passcode is device me yaad rahte hain (page code me nahi). */
+(function(){
+  var LS = {
+    get: function(k){ try { return localStorage.getItem(k) || ''; } catch(e){ return window['_ls_'+k] || ''; } },
+    set: function(k,v){ try { localStorage.setItem(k, v); } catch(e){ window['_ls_'+k] = v; } }
+  };
   try {
-    if (String(p.k || '') !== getApiKey_()) out = { ok:false, code:'KEY', error:'Wrong passcode.' };
-    else {
-      var f = API_FUNCS[p.fn];
-      if (!f) throw new Error('Unknown action: ' + p.fn);
-      var args;
-      if (p.s){
-        var raw = CacheService.getScriptCache().get('a_' + p.s);
-        if (!raw) throw new Error('Data nahi mila, dobara try kijiye.');
-        args = JSON.parse(raw);
-      } else args = JSON.parse(p.a || '[]');
-      out = { ok:true, data: f.apply(null, args) };
+    var h = location.hash.slice(1);
+    if (h){
+      var p = new URLSearchParams(h);
+      if (p.get('u')) LS.set('apiUrl', p.get('u'));
+      if (p.get('k')) LS.set('apiKey', p.get('k'));
+      history.replaceState(null, '', location.pathname + location.search);
     }
-  } catch(err){ out = { ok:false, error: (err && err.message) ? err.message : String(err) }; }
-  return apiOut_(p, out);
-}
-// Badi cheezein (aawaz, lamba paste) yahan POST hoti hain; jawab page nahi padhta, isliye CacheService me id se rakhte hain.
-function doPost(e){
-  var out;
-  try {
-    var b = JSON.parse(e.postData.contents);
-    if (String(b.key || '') !== getApiKey_()) out = { ok:false, code:'KEY', error:'Wrong passcode.' };
-    else if (b.kind === 'voice'){
-      var url = saveVoice_(b.b64, b.mime, b.task || 'voice');
-      CacheService.getScriptCache().put('v_' + b.id, url, 1800);
-      out = { ok:true };
-    } else if (b.kind === 'args'){
-      CacheService.getScriptCache().put('a_' + b.id, JSON.stringify(b.args || []), 1800);
-      out = { ok:true };
+  } catch(e){}
+  window.MIC_MODE = 'live';
+  window.MIC_LANG = LS.get('micLang') || 'mr-IN';
+  window.SAVE_VOICE = true;
+  var queue = [], setupShown = false;
+  function ready(){ return LS.get('apiUrl') && LS.get('apiKey'); }
+  function handle(j, ok, fail){
+    if (j && j.ok){
+      if (j.data && j.data.micLang){ window.MIC_LANG = j.data.micLang; window.SAVE_VOICE = j.data.saveVoice !== false; }
+      if (ok) ok(j.data);
     } else {
-      var f = API_FUNCS[b.fn];
-      if (!f) throw new Error('Unknown action: ' + b.fn);
-      out = { ok:true, data: f.apply(null, b.args || []) };
+      if (j && j.code === 'KEY'){ LS.set('apiKey', ''); showSetup('Passcode galat hai. Dobara daliye.'); }
+      if (fail) fail(new Error((j && j.error) || 'Unknown error'));
     }
-  } catch(err){ out = { ok:false, error: (err && err.message) ? err.message : String(err) }; }
-  return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
-}
-function sh_(n){ var s = SpreadsheetApp.getActive().getSheetByName(n); if (!s){ setup(); s = SpreadsheetApp.getActive().getSheetByName(n); } return s; }
-
-function today_(){ var s = Utilities.formatDate(new Date(), CONFIG.TZ, 'yyyy-MM-dd'); return Utilities.parseDate(s, CONFIG.TZ, 'yyyy-MM-dd'); }
-function ymd_(d){ return Utilities.formatDate(d, CONFIG.TZ, 'yyyy-MM-dd'); }
-function lbl_(d){ return Utilities.formatDate(d, CONFIG.TZ, 'dd MMM yyyy'); }
-function stamp_(){ return Utilities.formatDate(new Date(), CONFIG.TZ, 'dd-MM-yyyy HH:mm'); }
-function asDate_(v){
-  if (v instanceof Date && !isNaN(v)) return v;
-  var s = String(v||'').trim(); if (!s) return null;
-  var m = s.match(/^(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{4})/);
-  if (m) return Utilities.parseDate(m[3]+'-'+m[2]+'-'+m[1], CONFIG.TZ, 'yyyy-M-d');
-  var d = new Date(s); return isNaN(d) ? null : d;
-}
-function dayOnly_(d){ return Utilities.parseDate(ymd_(d), CONFIG.TZ, 'yyyy-MM-dd'); }
-function daysBetween_(a,b){ return Math.round((dayOnly_(b) - dayOnly_(a))/86400000); }
-function log_(action, task, by){ sh_(SH_LOG).appendRow([stamp_(), action, task, by||'']); }
-var _colsOk = false;
-function ensureCols_(t){
-  if (_colsOk) return;
-  if (t.getMaxColumns() < COLS) t.insertColumnsAfter(t.getMaxColumns(), COLS - t.getMaxColumns());
-  var h = t.getRange(1, COLS);
-  if (!String(h.getValue()).trim()) h.setValue(HEAD[COLS-1]).setFontWeight('bold').setFontColor('#ffffff').setBackground(CONFIG.ORANGE);
-  _colsOk = true;
-}
-function rows_(){
-  var t = sh_(SH_TASKS); ensureCols_(t); var last = t.getLastRow();
-  if (last < 2) return [];
-  return t.getRange(2,1,last-1,COLS).getValues();
-}
-function firstFreeRow_(t){
-  var last = t.getLastRow(); if (last < 2) return 2;
-  var c = t.getRange(2,3,last-1,1).getValues();
-  for (var i=c.length-1;i>=0;i--){ if (String(c[i][0]).trim()) return i+3; }
-  return 2;
-}
-
-function scoreFor_(vals, y, m, tdy){
-  var s = {given:0, done:0, ontime:0, late:0, pending:0, overdue:0, pts:0, counted:0};
-  vals.forEach(function(v){
-    if (!String(v[2]).trim()) return;
-    if (v[10] === true) return;
-    var due = asDate_(v[3]), given = asDate_(v[0]) || tdy, ref = due || given;
-    var rd = dayOnly_(ref);
-    if (Number(Utilities.formatDate(rd, CONFIG.TZ, 'yyyy')) !== y || Number(Utilities.formatDate(rd, CONFIG.TZ, 'M'))-1 !== m) return;
-    s.given++;
-    var done = v[6] === true, cOn = asDate_(v[12]), dOn = cOn || asDate_(v[7]);
-    if (done){
-      s.done++;
-      var late = due && dOn && daysBetween_(due, dOn) > 0;
-      if (late){ s.late++; s.pts += 50; } else { s.ontime++; s.pts += 100; }
-      s.counted++;
-    } else {
-      s.pending++;
-      if (due && daysBetween_(due, tdy) > 0){ s.overdue++; s.counted++; }
-    }
-  });
-  s.score = s.counted ? Math.round(s.pts / s.counted) : null;
-  return s;
-}
-function refreshScore(){
-  var vals = rows_(), tdy = today_(), sc = sh_(SH_SCORE);
-  var months = {}, y0 = Number(Utilities.formatDate(tdy, CONFIG.TZ, 'yyyy')), m0 = Number(Utilities.formatDate(tdy, CONFIG.TZ, 'M'))-1;
-  months[y0*12+m0] = 1;
-  vals.forEach(function(v){
-    if (!String(v[2]).trim()) return;
-    var r = asDate_(v[3]) || asDate_(v[0]); if (!r) return;
-    months[Number(Utilities.formatDate(r, CONFIG.TZ, 'yyyy'))*12 + Number(Utilities.formatDate(r, CONFIG.TZ, 'M'))-1] = 1;
-  });
-  var keys = Object.keys(months).map(Number).sort(function(a,b){ return b-a; });
-  var out = [['Month','Tasks','Done','On time','Late','Pending','Overdue','Score %']];
-  keys.forEach(function(k){
-    var y = Math.floor(k/12), m = k%12, s = scoreFor_(vals, y, m, tdy);
-    var name = Utilities.formatDate(new Date(y, m, 15), CONFIG.TZ, 'MMM yyyy');
-    out.push([name, s.given, s.done, s.ontime, s.late, s.pending, s.overdue, s.score === null ? '-' : s.score]);
-  });
-  sc.clear();
-  sc.getRange(1,1,out.length,8).setValues(out);
-  sc.getRange(1,1,1,8).setFontWeight('bold').setFontColor('#ffffff').setBackground(CONFIG.ORANGE);
-  sc.getRange(out.length+2,1).setValue('Score rule: done on time = 100, done late = 50, not done after due date = 0. Tasks not yet due are not counted. Score % = average.').setFontStyle('italic').setFontColor('#666666');
-  var t = sh_(SH_TASKS);
-  if (vals.length){
-    var res = vals.map(function(v){
-      if (!String(v[2]).trim()) return [''];
-      if (v[10] === true) return ['Someday'];
-      var due = asDate_(v[3]), cOn = asDate_(v[12]), dOn = cOn || asDate_(v[7]);
-      if (v[6] === true) return [(due && dOn && daysBetween_(due, dOn) > 0) ? 'Late' : 'On time'];
-      if (cOn) return [(due && daysBetween_(due, cOn) > 0) ? 'Completed (late)' : 'Completed'];
-      if (due && daysBetween_(due, tdy) > 0) return ['Overdue'];
-      return ['Pending'];
-    });
-    t.getRange(2,9,res.length,1).setValues(res);
   }
-}
-
-function doGet(e){
-  if (e && e.parameter && e.parameter.fn) return apiGet_(e.parameter);
-  var cfg = '<script>window.MIC_LANG=' + JSON.stringify(CONFIG.MIC_LANG) + ';window.SAVE_VOICE=' + (CONFIG.SAVE_VOICE ? 'true' : 'false') + ';window.MIC_MODE=' + JSON.stringify(CONFIG.MIC_MODE) + ';</' + 'script>';
-  return HtmlService.createHtmlOutput(HTML_.replace('</body>', cfg + VOICE_HTML + '</body>'))
-    .setTitle(CONFIG.TITLE)
-    .addMetaTag('viewport','width=device-width, initial-scale=1');
-}
-function getData(){
-  var vals = rows_(), tdy = today_(), ts = ymd_(tdy), list = [], someday = [], doneList = [], allDone = [], nowMs = new Date().getTime();
-  var c = {pending:0, overdue:0, today:0, doneMonth:0, someday:0};
-  for (var r=0;r<vals.length;r++){
-    var v = vals[r]; if (!String(v[2]).trim()) continue;
-    var isSome = v[10] === true;
-    var done = v[6] === true, cOn = asDate_(v[12]), dOn = asDate_(v[7]), due = asDate_(v[3]), given = asDate_(v[0]), sOn = asDate_(v[11]);
-    if (isSome){
-      c.someday++;
-      someday.push({ row:r+2, voice:String(v[13]||''), t:String(v[2]), by:String(v[1]||''), prio:String(v[4]||'Normal'),
-        given: given?lbl_(given):'-', due: due?lbl_(due):'-', upd:String(v[5]||''),
-        somedayOn: sOn ? Utilities.formatDate(sOn, CONFIG.TZ, 'dd-MM-yyyy HH:mm') : '' });
-      continue;
-    }
-    var status = done ? 'done' : (cOn ? 'waiting' : (!due ? 'open' : (ymd_(due) < ts ? 'overdue' : (ymd_(due) === ts ? 'today' : 'upcoming'))));
-    if (!done){ c.pending++; if (status==='overdue') c.overdue++; if (status==='today') c.today++; }
-    else if (dOn && Utilities.formatDate(dOn, CONFIG.TZ, 'yyyy-MM') === Utilities.formatDate(tdy, CONFIG.TZ, 'yyyy-MM')){
-      c.doneMonth++;
-      doneList.push({ row:r+2, voice:String(v[13]||''), t:String(v[2]), by:String(v[1]||''), prio:String(v[4]||'Normal'),
-        given: given?lbl_(given):'-', due: due?lbl_(due):'-',
-        days: due ? daysBetween_(tdy, due) : null, upd:String(v[5]||''), done:true,
-        doneOn: dOn ? Utilities.formatDate(dOn, CONFIG.TZ, 'dd-MM-yyyy HH:mm') : '',
-        completed: !!cOn, completedOn: cOn ? Utilities.formatDate(cOn, CONFIG.TZ, 'dd-MM-yyyy HH:mm') : '',
-        late: due && (cOn||dOn) && daysBetween_(due, cOn||dOn) > 0, status:'done' });
-    }
-    if (done){
-      allDone.push({ row:r+2, voice:String(v[13]||''), t:String(v[2]), by:String(v[1]||''), prio:String(v[4]||'Normal'),
-        given: given?lbl_(given):'-', due: due?lbl_(due):'-', days:null, upd:String(v[5]||''), done:true,
-        doneOn: dOn ? Utilities.formatDate(dOn, CONFIG.TZ, 'dd-MM-yyyy HH:mm') : '',
-        completed: !!cOn, completedOn: cOn ? Utilities.formatDate(cOn, CONFIG.TZ, 'dd-MM-yyyy HH:mm') : '',
-        late: due && (cOn||dOn) && daysBetween_(due, cOn||dOn) > 0, status:'done', dts: dOn ? dOn.getTime() : 0 });
-      if (!dOn || (nowMs - dOn.getTime()) > CONFIG.DONE_HIDE_HOURS * 3600000) continue;
-    }
-    list.push({
-      row: r+2, voice: String(v[13]||''), t: String(v[2]), by: String(v[1]||''), prio: String(v[4]||'Normal'),
-      given: given ? lbl_(given) : '-', due: due ? lbl_(due) : '-',
-      days: due ? daysBetween_(tdy, due) : null, upd: String(v[5]||''), done: done,
-      doneOn: dOn ? Utilities.formatDate(dOn, CONFIG.TZ, 'dd-MM-yyyy HH:mm') : '',
-      completed: !!cOn, completedOn: cOn ? Utilities.formatDate(cOn, CONFIG.TZ, 'dd-MM-yyyy HH:mm') : '',
-      late: done && due && (cOn||dOn) && daysBetween_(due, cOn||dOn) > 0, status: status, gts: given ? given.getTime() : 0
-    });
+  var cbn = 0;
+  // JSONP: <script> tag se GET - isme CORS / "Failed to fetch" ki dikkat nahi aati
+  function jsonp(fn, extra, ok, fail){
+    var cb = '__ea' + Date.now().toString(36) + (cbn++), done = false, sc = document.createElement('script');
+    function clean(){ done = true; try { delete window[cb]; } catch(e){ window[cb] = undefined; } if (sc.parentNode) sc.parentNode.removeChild(sc); }
+    window[cb] = function(j){ if (done) return; clean(); handle(j, ok, fail); };
+    sc.onerror = function(){ if (done) return; clean(); if (fail) fail(new Error('Sheet se jud nahi paya. Script link check kijiye, aur Deploy me "Who has access: Anyone" + New version kijiye.')); };
+    setTimeout(function(){ if (done) return; clean(); if (fail) fail(new Error('Sheet ne 90 second me jawab nahi diya. Internet check karke dobara try kijiye.')); }, 90000);
+    sc.src = LS.get('apiUrl') + '?fn=' + encodeURIComponent(fn) + '&k=' + encodeURIComponent(LS.get('apiKey')) + '&cb=' + cb + extra + '&_=' + Date.now();
+    (document.head || document.documentElement).appendChild(sc);
   }
-  // Kram: 1) laal URGENT (High + late) 2) laal URGENT (High + aaj) 3) baaki pending 4) Done sabse niche
-  function rank_(x){ if (x.done) return 3; if (x.prio === 'High' && x.status === 'overdue') return 0; if (x.prio === 'High' && x.status === 'today') return 1; return 2; }
-  list.sort(function(a,b){ return (rank_(a)-rank_(b)) || (b.gts-a.gts) || (b.row-a.row); });
-  allDone.sort(function(a,b){ return (b.dts-a.dts) || (b.row-a.row); });
-  if (allDone.length > CONFIG.DONE_TAB_MAX) allDone = allDone.slice(0, CONFIG.DONE_TAB_MAX);
-  someday.sort(function(a,b){ return b.row-a.row; });
-  doneList.sort(function(a,b){ return b.row-a.row; });
-  var sm = scoreFor_(vals, Number(Utilities.formatDate(tdy, CONFIG.TZ, 'yyyy')), Number(Utilities.formatDate(tdy, CONFIG.TZ, 'M'))-1, tdy);
-  return { title: CONFIG.TITLE, todayLabel: Utilities.formatDate(tdy, CONFIG.TZ, 'EEEE, dd MMM yyyy'),
-           monthLabel: Utilities.formatDate(tdy, CONFIG.TZ, 'MMMM yyyy'),
-           list: list, someday: someday, doneList: doneList, allDone: allDone, c: c, score: sm, givers: CONFIG.GIVERS, prios: CONFIG.PRIOS,
-           micLang: CONFIG.MIC_LANG, saveVoice: CONFIG.SAVE_VOICE };
-}
-
-// Same given-date + same task text = already in the sheet, so it is skipped.
-function key_(d, t){ var a = asDate_(d); return (a ? ymd_(a) : '') + '|' + String(t).trim().toLowerCase(); }
-
-// Line format:  date | task | due | priority   (due blank = Someday)
-function addBulk(text){
-  var lines = String(text||'').replace(/[\uFF5C\u2502\u00A6]/g,'|').split('\n');
-  var lock = LockService.getScriptLock(); lock.waitLock(20000);
-  var added = 0, skipped = 0, dup = 0, seen = {};
-  try {
-    var t = sh_(SH_TASKS);
-    rows_().forEach(function(v){ if (String(v[2]).trim()) seen[key_(v[0], v[2])] = 1; });
-    lines.forEach(function(line){
-      line = line.trim();
-      if (!line || line.indexOf('```') === 0) return;
-      var p = line.split('|').map(function(s){ return s.trim(); });
-      var task = p[1] || '';
-      if (!task){ skipped++; return; }
-      var given = asDate_(p[0]) || today_();
-      var dueText = p[2] || '';
-      var due = dueText ? asDate_(dueText) : null;
-      if (dueText && !due){ skipped++; return; }
-      var k = key_(given, task);
-      if (seen[k]){ dup++; return; }
-      seen[k] = 1;
-      var prio = CONFIG.PRIOS.indexOf(p[3]) >= 0 ? p[3] : 'Normal';
-      var someday = !due;
-      var r = firstFreeRow_(t);
-      if (String(t.getRange(r,3).getValue()).trim()) r = t.getLastRow() + 1;
-      t.getRange(r,1,1,COLS).setValues([[given, 'Sanket', task, due || '', prio, '', false, '', someday ? 'Someday' : 'Pending', 0, someday, someday ? new Date() : '', '', '']]);
-      t.getRange(r,1).setNumberFormat('dd-MM-yyyy');
-      if (due) t.getRange(r,4).setNumberFormat('dd-MM-yyyy');
-      if (someday) t.getRange(r,12).setNumberFormat('dd-MM-yyyy HH:mm');
-      t.getRange(r,7).insertCheckboxes().setValue(false);
-      t.getRange(r,11).insertCheckboxes().setValue(someday);
-      log_('Task added', task, 'Sanket');
-      if (someday) log_('Moved to Someday', task, '');
-      added++;
-    });
-    refreshScore();
-    SpreadsheetApp.flush();
-  } finally { lock.releaseLock(); }
-  var d = getData();
-  d.bulkMsg = added + ' added.' + (dup ? ' Already there (skipped): ' + dup + '.' : '') + (skipped ? ' Bad lines: ' + skipped + '.' : '');
-  return d;
-}
-
-function addTask(by, task, dueYmd, prio, voiceB64, voiceMime, voiceId){
-  task = String(task||'').trim(); by = String(by||'').trim();
-  if (!task) throw new Error('Please write the task.');
-  if (CONFIG.GIVERS.indexOf(by) < 0) throw new Error('Please choose who is giving the task.');
-  if (CONFIG.PRIOS.indexOf(prio) < 0) prio = 'Normal';
-  if (dueYmd && dueYmd < ymd_(today_())) throw new Error('Due date cannot be before today. Please choose today or a later date.');
-  var voice = '';
-  if (voiceB64){ try { voice = saveVoice_(voiceB64, voiceMime, task); } catch(e){ voice = 'Voice save failed: ' + e.message; } }
-  else if (voiceId){
-    var cache = CacheService.getScriptCache();
-    for (var i = 0; i < 8 && !voice; i++){ voice = cache.get('v_' + voiceId) || ''; if (!voice) Utilities.sleep(1000); }
-    if (!voice) voice = 'Voice save failed: upload nahi mila';
+  // Badi cheez (aawaz / lamba text) POST se bhejo; jawab nahi padhna (no-cors), sirf pahunchna zaruri hai
+  function stash(body){
+    return fetch(LS.get('apiUrl'), { method:'POST', mode:'no-cors', body: JSON.stringify(body) });
   }
-  var lock = LockService.getScriptLock(); lock.waitLock(20000);
-  try {
-    var t = sh_(SH_TASKS); ensureCols_(t); var r = firstFreeRow_(t);
-    var due = dueYmd ? Utilities.parseDate(dueYmd, CONFIG.TZ, 'yyyy-MM-dd') : '';
-    t.getRange(r,1,1,COLS).setValues([[today_(), by, task, due, prio, '', false, '', 'Pending', 0, false, '', '', voice]]);
-    t.getRange(r,7).insertCheckboxes();
-    t.getRange(r,11).insertCheckboxes();
-    log_('Task added', task, by);
-    refreshScore();
-    SpreadsheetApp.flush();
-  } finally { lock.releaseLock(); }
-  return getData();
-}
+  function rid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
+  function send(fn, args, ok, fail){
+    var key = LS.get('apiKey');
+    if (fn === 'addTask' && args[4]){
+      var vid = rid();
+      stash({ key:key, kind:'voice', id:vid, b64:args[4], mime:args[5], task:args[1] })
+        .then(function(){ send('addTask', [args[0], args[1], args[2], args[3], '', '', vid], ok, fail); })
+        .catch(function(){
+          alert('Aawaz upload nahi hui (internet?). Kaam bina aawaz ke add ho raha hai.');
+          send('addTask', [args[0], args[1], args[2], args[3], '', ''], ok, fail);
+        });
+      return;
+    }
+    var enc = encodeURIComponent(JSON.stringify(args));
+    if (enc.length > 1500){
+      var id = rid();
+      stash({ key:key, kind:'args', id:id, args:args })
+        .then(function(){ jsonp(fn, '&s=' + id, ok, fail); })
+        .catch(function(e){ if (fail) fail(new Error('Internet ya link ki problem: ' + (e && e.message ? e.message : e))); });
+      return;
+    }
+    jsonp(fn, '&a=' + enc, ok, fail);
+  }
+  function flush(){ var q = queue; queue = []; q.forEach(function(c){ send(c[0], c[1], c[2], c[3]); }); }
+  function runner(){
+    var ok = null, fail = null, o;
+    o = new Proxy({}, { get: function(t, k){
+      if (k === 'withSuccessHandler') return function(f){ ok = f; return o; };
+      if (k === 'withFailureHandler') return function(f){ fail = f; return o; };
+      return function(){
+        var a = Array.prototype.slice.call(arguments);
+        if (ready()) send(k, a, ok, fail);
+        else { queue.push([k, a, ok, fail]); showSetup(''); }
+      };
+    }});
+    return o;
+  }
+  window.google = { script: {} };
+  Object.defineProperty(window.google.script, 'run', { get: runner });
 
-// ---------- Voice (aawaz) ----------
-function voiceFolder_(){
-  var it = DriveApp.getFoldersByName(CONFIG.VOICE_FOLDER);
-  return it.hasNext() ? it.next() : DriveApp.createFolder(CONFIG.VOICE_FOLDER);
-}
-function saveVoice_(b64, mime, task){
-  mime = String(mime||'audio/webm').split(';')[0];
-  var map = {'audio/mp4':'m4a','audio/x-m4a':'m4a','audio/m4a':'m4a','audio/aac':'aac','audio/mpeg':'mp3','audio/mp3':'mp3','audio/ogg':'ogg','audio/wav':'wav','audio/x-wav':'wav','audio/3gpp':'3gp','video/3gpp':'3gp','audio/amr':'amr','audio/webm':'webm','video/webm':'webm','video/mp4':'m4a'};
-  var ext = map[mime] || 'webm';
-  var name = Utilities.formatDate(new Date(), CONFIG.TZ, 'yyyy-MM-dd_HHmm') + '_' + String(task).slice(0,40).replace(/[\\\/:*?"<>|\n\r]/g,' ') + '.' + ext;
-  var file = voiceFolder_().createFile(Utilities.newBlob(Utilities.base64Decode(b64), mime, name));
-  return file.getUrl();
-}
-// Dashboard ka play button isse aawaz mangata hai (sirf EA Task Voice folder ki files)
-function getVoice(url){
-  var m = String(url||'').match(/[-\w]{25,}/);
-  if (!m) throw new Error('Voice link not found.');
-  var file = DriveApp.getFileById(m[0]);
-  var ok = false, ps = file.getParents();
-  while (ps.hasNext()){ if (ps.next().getName() === CONFIG.VOICE_FOLDER) ok = true; }
-  if (!ok) throw new Error('This file is not a task voice.');
-  var blob = file.getBlob();
-  return { mime: blob.getContentType() || 'audio/webm', data: Utilities.base64Encode(blob.getBytes()) };
-}
-function updateTask(row, text){
-  text = String(text||'').trim(); if (!text) throw new Error('Update is empty.');
-  var lock = LockService.getScriptLock(); lock.waitLock(20000);
-  try {
-    var t = sh_(SH_TASKS);
-    if (row < 2 || row > t.getLastRow() || !String(t.getRange(row,3).getValue()).trim()) throw new Error('Task not found.');
-    if (t.getRange(row,7).getValue() === true) throw new Error('This task is already done.');
-    var cell = t.getRange(row,6), old = String(cell.getValue()||'');
-    cell.setValue((old ? old + '\n' : '') + stamp_() + ' - ' + text);
-    var n = t.getRange(row,10); n.setValue((Number(n.getValue())||0) + 1);
-    log_('Update', String(t.getRange(row,3).getValue()), text);
-    SpreadsheetApp.flush();
-  } finally { lock.releaseLock(); }
-  return getData();
-}
-function doneTask(row, pin){
-  if (String(pin||'') !== String(CONFIG.DONE_PIN)) throw new Error('Wrong PIN. Only Sanket can mark a task Done.');
-  var lock = LockService.getScriptLock(); lock.waitLock(20000);
-  try {
-    var t = sh_(SH_TASKS);
-    if (row < 2 || row > t.getLastRow() || !String(t.getRange(row,3).getValue()).trim()) throw new Error('Task not found.');
-    if (t.getRange(row,7).getValue() === true) throw new Error('Already done.');
-    t.getRange(row,7).insertCheckboxes().setValue(true);
-    t.getRange(row,8).setValue(new Date()).setNumberFormat('dd-MM-yyyy HH:mm');
-    log_('Done (PIN)', String(t.getRange(row,3).getValue()), 'Sanket');
-    refreshScore();
-    SpreadsheetApp.flush();
-  } finally { lock.releaseLock(); }
-  return getData();
-}
-function completedTask(row){
-  var lock = LockService.getScriptLock(); lock.waitLock(20000);
-  try {
-    var t = sh_(SH_TASKS);
-    if (row < 2 || row > t.getLastRow() || !String(t.getRange(row,3).getValue()).trim()) throw new Error('Task not found.');
-    if (t.getRange(row,7).getValue() === true) throw new Error('This task is already done.');
-    if (t.getRange(row,11).getValue() === true) throw new Error('This task is in Someday. Move it back to Live first.');
-    if (t.getRange(row,13).getValue()) throw new Error('Already marked completed.');
-    t.getRange(row,13).setValue(new Date()).setNumberFormat('dd-MM-yyyy HH:mm');
-    log_('Completed (EA)', String(t.getRange(row,3).getValue()), '');
-    refreshScore();
-    SpreadsheetApp.flush();
-  } finally { lock.releaseLock(); }
-  return getData();
-}
-function somedayTask(row){
-  var lock = LockService.getScriptLock(); lock.waitLock(20000);
-  try {
-    var t = sh_(SH_TASKS);
-    if (row < 2 || row > t.getLastRow() || !String(t.getRange(row,3).getValue()).trim()) throw new Error('Task not found.');
-    if (t.getRange(row,7).getValue() === true) throw new Error('This task is already done.');
-    if (t.getRange(row,13).getValue()) throw new Error('This task is already Completed. Ask Sanket to confirm.');
-    t.getRange(row,11).insertCheckboxes().setValue(true);
-    t.getRange(row,12).setValue(new Date()).setNumberFormat('dd-MM-yyyy HH:mm');
-    log_('Moved to Someday', String(t.getRange(row,3).getValue()), '');
-    refreshScore();
-    SpreadsheetApp.flush();
-  } finally { lock.releaseLock(); }
-  return getData();
-}
-function toLiveTask(row, newDueYmd){
-  var lock = LockService.getScriptLock(); lock.waitLock(20000);
-  try {
-    var t = sh_(SH_TASKS);
-    if (row < 2 || row > t.getLastRow() || !String(t.getRange(row,3).getValue()).trim()) throw new Error('Task not found.');
-    if (newDueYmd && newDueYmd < ymd_(today_())) throw new Error('Due date cannot be before today. Please choose today or a later date.');
-    t.getRange(row,11).setValue(false);
-    t.getRange(row,12).setValue('');
-    if (newDueYmd){ try { t.getRange(row,4).setValue(Utilities.parseDate(newDueYmd, CONFIG.TZ, 'yyyy-MM-dd')).setNumberFormat('dd-MM-yyyy'); } catch(e){} }
-    log_('Moved to Live', String(t.getRange(row,3).getValue()), '');
-    refreshScore();
-    SpreadsheetApp.flush();
-  } finally { lock.releaseLock(); }
-  return getData();
-}
-
-var HTML_ = '<!DOCTYPE html><html><head><base target="_top"><style>' +
-'body{font-family:Arial,sans-serif;margin:0;background:#FFF6EE;color:#222}' +
-'.top{background:#E8731C;color:#fff;padding:14px 18px}.top h1{margin:0;font-size:22px}.top div{font-size:13px;opacity:.95}' +
-'.wrap{max-width:960px;margin:0 auto;padding:14px}' +
-'.kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:14px}' +
-'.k{background:#fff;border-radius:10px;padding:12px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.12);cursor:pointer;transition:transform .1s}.k:hover{transform:translateY(-2px)}.k.sel{outline:3px solid #E8731C;outline-offset:-3px}' +
-'.k b{display:block;font-size:28px;color:#E8731C}.k span{font-size:12px;color:#555}.k.red b{color:#C62828}.k.green b{color:#2E7D32}' +
-'.card{background:#fff;border-radius:10px;padding:12px;margin-bottom:14px;box-shadow:0 1px 3px rgba(0,0,0,.12)}' +
-'.card h2{margin:0 0 10px;font-size:16px;color:#E8731C}' +
-'.form{display:grid;grid-template-columns:110px 1fr 54px 140px 100px 110px;gap:8px}' +
-'input,select,button{font-size:14px;padding:8px;border:1px solid #ddd;border-radius:6px}' +
-'button{background:#E8731C;color:#fff;border:none;cursor:pointer;font-weight:bold}button.gr{background:#2E7D32}' +
-'.task{display:flex;gap:10px;border-left:6px solid #ccc;background:#fff;border-radius:8px;padding:10px;margin-bottom:8px;box-shadow:0 1px 2px rgba(0,0,0,.1)}' +
-'.task.overdue{border-color:#C62828;background:#FFF0F0}.task.today{border-color:#E8731C}.task.upcoming{border-color:#1565C0}.task.open{border-color:#999}.task.done{border-color:#2E7D32;background:#F1F8F1;opacity:.85}' +
-'.name{font-weight:bold;font-size:15px}.meta{font-size:12px;margin-top:4px}.tag{display:inline-block;padding:1px 7px;border-radius:9px;background:#eee;margin-right:6px}' +
-'.tag.High{background:#FFCDD2}.tag.Low{background:#E0E0E0}.dates{font-size:12px;color:#555;margin-top:3px}' +
-'.upd{white-space:pre-wrap;font-size:12px;background:#FFF8E1;border-radius:6px;padding:6px;margin-top:6px}' +
-'.btns{display:flex;flex-direction:column;gap:6px}.dn{color:#2E7D32;font-weight:bold;text-align:right;font-size:13px}' +
-'.msg{text-align:center;color:#777;padding:14px}#err{color:#C62828;font-weight:bold}' +
-'.tabs{display:flex;gap:4px;margin-bottom:10px}.tab{background:#F2E1D1;color:#555;border:none;padding:10px 18px;border-radius:8px 8px 0 0;font-weight:bold;cursor:pointer}.tab.on{background:#fff;color:#E8731C;box-shadow:0 -2px 4px rgba(0,0,0,.08)}.tab span.n{background:#fff;color:#E8731C;border-radius:9px;padding:1px 7px;margin-left:6px;font-size:12px}.tab.on span.n{background:#FFF0E1}.task.someday{border-color:#8E24AA;background:#F7F0FA}button.pu{background:#8E24AA}.task.waiting{border-color:#F9A825;background:#FFFDF2}button.cp{background:#F9A825;color:#000}.pkpis{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px}.pk{background:#fff;border-radius:12px;padding:26px 12px;text-align:center;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.12);border-top:8px solid #999}.pk b{display:block;font-size:42px}.pk span{font-size:17px;font-weight:bold;color:#555}.pk[data-p=High]{border-color:#C62828}.pk[data-p=High] b{color:#C62828}.pk[data-p=Normal]{border-color:#E8731C}.pk[data-p=Normal] b{color:#E8731C}.pk[data-p=Low]{border-color:#1565C0}.pk[data-p=Low] b{color:#1565C0}.pk[data-on]{outline:3px solid #333;outline-offset:-3px}@media(max-width:700px){.kpis{grid-template-columns:repeat(2,1fr)}.form{grid-template-columns:1fr 1fr}.task{flex-direction:column}.btns{flex-direction:row}}' +
-'</style></head><body>' +
-'<div class="top"><h1 id="ttl">Sanket – EA Tasks</h1><div id="dt">Loading...</div></div>' +
-'<div class="wrap"><div class="kpis" id="kpis"></div><div class="pkpis" id="pkpis"></div>' +
-'<div class="card"><h2>+ Add task</h2><div class="form">' +
-'<select id="by"></select><input id="task" placeholder="Task"><button id="micBtn" type="button" title="Bolkar likhein">&#127908;</button><input id="due" type="date"><select id="prio"></select><button id="addBtn">Add</button>' +
-'</div><input type="file" id="micFile" accept="audio/*" capture style="display:none"><div id="micSt"></div><div id="micPrev"></div><div id="err"></div></div>' +
-'<div class="card"><h2>Paste tasks (from Claude)</h2><textarea id="bulk" rows="5" style="width:100%;box-sizing:border-box;font-size:13px;padding:8px;border:1px solid #ddd;border-radius:6px" placeholder="31-10-2026 | task | due (dd-mm-yyyy, blank = Someday) | priority"></textarea><div style="margin-top:8px"><button id="bulkBtn">Paste &amp; add</button> <span id="bulkMsg" style="margin-left:10px;font-weight:bold;color:#2E7D32"></span></div></div>' +
-'<div class="tabs"><button id="tabA" class="tab on" data-v="active">Active <span class="n" id="cA"></span></button><button id="tabS" class="tab" data-v="someday">Someday <span class="n" id="cS"></span></button><button id="tabD" class="tab" data-v="done">Done work <span class="n" id="cD"></span></button></div>' +
-'<div class="card"><div id="list"><div class="msg">Loading...</div></div></div></div>' +
-'<script>' +
-'function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c];});}' +
-'var busy=false;' +
-'function err(e){busy=false;document.getElementById("err").textContent=(e&&e.message)?e.message:String(e);}' +
-'function call(fn,args){if(busy)return;busy=true;document.getElementById("err").textContent="";var r=google.script.run.withSuccessHandler(function(d){busy=false;render(d);}).withFailureHandler(err);r[fn].apply(r,args);}' +
-'function fill(id,arr){var s=document.getElementById(id);if(s.options.length)return;arr.forEach(function(v){var o=document.createElement("option");o.value=v;o.textContent=v;s.appendChild(o);});}' +
-'function itemHtml(x){var when="";if(x.status==="overdue")when="<b style=\\"color:#C62828\\">OVERDUE "+(-x.days)+(x.days===-1?" day":" days")+"</b>";else if(x.status==="today")when="<b style=\\"color:#E8731C\\">DUE TODAY</b>";else if(x.status==="upcoming")when="due in "+x.days+(x.days===1?" day":" days");else if(x.status==="open")when="no due date";var h="<div class=\\"task "+x.status+"\\"><div style=\\"flex:1;min-width:0\\"><div class=name>"+esc(x.t)+"</div>";h+="<div class=meta><span class=tag>By "+esc(x.by)+"</span><span class=\\"tag "+esc(x.prio)+"\\">"+esc(x.prio)+"</span>"+when+"</div>";h+="<div class=dates>Given: <b>"+esc(x.given)+"</b> &nbsp;&middot;&nbsp; Due: <b>"+esc(x.due)+"</b></div>";if(x.completed&&!x.done)h+="<div class=upd style=\\"background:#FFF8E1;color:#8D6E00;border-left-color:#F9A825\\">&#10003; Completed by EA on "+esc(x.completedOn)+" &middot; waiting for Sanket PIN</div>";if(x.upd)h+="<div class=upd>"+esc(x.upd)+"</div>";h+="</div>";if(x.done)h+="<div class=dn>&#10003; Done"+(x.late?" (late)":" (on time)")+"<br><span style=\\"font-weight:normal;color:#555\\">"+esc(x.doneOn)+"</span></div>";else if(x.completed) h+="<div class=btns><button data-a=upd data-r="+x.row+">Update</button><button class=gr data-a=done data-r="+x.row+">Done &#10003;</button></div>";else h+="<div class=btns><button data-a=upd data-r="+x.row+">Update</button><button class=cp data-a=completed data-r="+x.row+">Completed</button><button class=gr data-a=done data-r="+x.row+">Done &#10003;</button><button class=pu data-a=someday data-r="+x.row+">Someday</button></div>";h+="</div>";return h;}' +
-'function somedayHtml(x){var h="<div class=\\"task someday\\"><div style=\\"flex:1;min-width:0\\"><div class=name>"+esc(x.t)+"</div>";h+="<div class=meta><span class=tag>By "+esc(x.by)+"</span><span class=\\"tag "+esc(x.prio)+"\\">"+esc(x.prio)+"</span>Moved: "+esc(x.somedayOn)+"</div>";h+="<div class=dates>Given: <b>"+esc(x.given)+"</b> &nbsp;&middot;&nbsp; Due: <b>"+esc(x.due)+"</b></div>";if(x.upd)h+="<div class=upd>"+esc(x.upd)+"</div>";h+="</div>";h+="<div class=btns><button data-a=tolive data-r="+x.row+">Move to Live</button></div></div>";return h;}' +
-'function applyView(){var d=window._d;if(!d)return;var tab=document.querySelector(".tab.on").getAttribute("data-v");var f=window._filter||"all";var items=[],msg="";if(tab==="done"){items=d.allDone||[];msg="No done tasks yet";}else if(tab==="someday"){items=d.someday;msg="No Someday tasks";}else if(f==="overdue"){items=d.list.filter(function(x){return x.status==="overdue";});msg="No overdue tasks";}else if(f==="today"){items=d.list.filter(function(x){return x.status==="today";});msg="No tasks due today";}else if(f==="pending"){items=d.list.filter(function(x){return !x.done;});msg="No pending tasks";}else if(f==="done"){items=d.doneList;msg="No tasks done this month";}else{items=d.list;msg="No open tasks";}if(window._prio){items=items.filter(function(x){return x.prio===window._prio;});msg="No "+window._prio+" tasks here";}var ph="";["High","Normal","Low"].forEach(function(p){var n=d.list.filter(function(x){return !x.done&&x.prio===p;}).length;ph+="<div class=pk data-p="+p+(window._prio===p?" data-on=1":"")+"><b>"+n+"</b><span>"+p+"</span></div>";});document.getElementById("pkpis").innerHTML=ph;var h="";if(!items.length)h="<div class=msg>"+msg+"</div>";else items.forEach(function(x){h+=(tab==="someday"?somedayHtml(x):itemHtml(x));});document.getElementById("list").innerHTML=h;document.querySelectorAll(".k").forEach(function(k){k.classList.remove("sel");});var sel=document.querySelector(tab==="someday"?".k[data-f=someday]":(".k[data-f=\\""+f+"\\"]"));if(sel)sel.classList.add("sel");}' +
-'function render(d){' +
-' document.getElementById("ttl").textContent=d.title;document.getElementById("dt").textContent=d.todayLabel;' +
-' document.getElementById("due").min=todayYmd(); fill("by",d.givers);fill("prio",d.prios);document.getElementById("prio").value="Normal";' +
-' document.getElementById("cA").textContent=d.list.filter(function(x){return !x.done;}).length;document.getElementById("cS").textContent=d.someday.length;document.getElementById("cD").textContent=(d.allDone||[]).length;' +
-' var s=d.score,sc=(s.score===null?"-":s.score+"%");' +
-' document.getElementById("kpis").innerHTML=' +
-'  "<div class=\\"k sel\\" data-f=pending><b>"+d.c.pending+"</b><span>Pending</span></div>"+' +
-'  "<div class=\\"k red\\" data-f=overdue><b>"+d.c.overdue+"</b><span>Overdue</span></div>"+' +
-'  "<div class=k data-f=today><b>"+d.c.today+"</b><span>Due today</span></div>"+' +
-'  "<div class=\\"k green\\" data-f=done><b>"+d.c.doneMonth+"</b><span>Done this month</span></div>"+' +
-'  "<div class=k data-f=someday><b>"+d.c.someday+"</b><span>Someday</span></div>"+' +
-'  "<div class=k><b>"+sc+"</b><span>EA score "+esc(d.monthLabel)+"<br>On time "+s.ontime+" · Late "+s.late+" · Overdue "+s.overdue+"</span></div>";' +
-' window._d=d; applyView();}' +
-'document.getElementById("addBtn").onclick=function(){var t=document.getElementById("task").value.trim();if(!t){err("Please write the task.");return;}var dv=document.getElementById("due").value;if(dv&&dv<todayYmd()){err("Due date cannot be before today. Please choose today or a later date.");alert("Due date cannot be before today.");return;}' +
-' call("addTask",[document.getElementById("by").value,t,document.getElementById("due").value,document.getElementById("prio").value]);' +
-' document.getElementById("task").value="";document.getElementById("due").value="";};' +
-'function todayYmd(){var d=new Date();return d.getFullYear()+"-"+("0"+(d.getMonth()+1)).slice(-2)+"-"+("0"+d.getDate()).slice(-2);}' +
-'function pickDate(r){var o=document.createElement("div");o.style.cssText="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:99";var b=document.createElement("div");b.style.cssText="background:#fff;padding:20px;border-radius:12px;width:290px;font-family:Arial";var t=document.createElement("div");t.textContent="Move to Live - select new due date (optional)";t.style.cssText="font-weight:bold;margin-bottom:12px;color:#E8731C";var i=document.createElement("input");i.type="date";i.min=todayYmd();i.style.cssText="width:100%;padding:10px;font-size:16px;box-sizing:border-box;margin-bottom:14px";var ok=document.createElement("button");ok.textContent="Move to Live";var no=document.createElement("button");no.textContent="Cancel";no.style.cssText="background:#999;margin-left:8px";ok.onclick=function(){if(i.value&&i.value<todayYmd()){alert("Due date cannot be before today. Please choose today or a later date.");return;}document.body.removeChild(o);call("toLiveTask",[r,i.value||""]);};no.onclick=function(){document.body.removeChild(o);};b.appendChild(t);b.appendChild(i);b.appendChild(ok);b.appendChild(no);o.appendChild(b);document.body.appendChild(o);setTimeout(function(){try{i.focus();if(i.showPicker)i.showPicker();}catch(e){}},50);}' +
-'document.getElementById("list").onclick=function(e){var b=e.target.closest("button");if(!b)return;var r=Number(b.getAttribute("data-r"));var a=b.getAttribute("data-a");' +
-' if(a==="upd"){var u=prompt("Write the update for this task:");if(u&&u.trim())call("updateTask",[r,u.trim()]);}' +
-' else if(a==="someday"){if(confirm("Move this task to Someday?"))call("somedayTask",[r]);}' +
-' else if(a==="completed"){if(confirm("Mark this task Completed? Sanket will confirm with PIN."))call("completedTask",[r]);}' +
-' else if(a==="tolive"){pickDate(r);}' +
-' else{var p=prompt("Enter PIN to mark Done:");if(p)call("doneTask",[r,p]);}};' +
-'document.querySelectorAll(".tab").forEach(function(t){t.onclick=function(){document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("on");});t.classList.add("on");if(t.getAttribute("data-v")!=="someday")window._filter="all";applyView();};});' +
-'document.getElementById("pkpis").onclick=function(e){var k=e.target.closest(".pk");if(!k)return;var p=k.getAttribute("data-p");window._prio=(window._prio===p?"":p);applyView();};' +
-'document.getElementById("kpis").onclick=function(e){var k=e.target.closest(".k");if(!k||!k.hasAttribute("data-f"))return;var f=k.getAttribute("data-f");if(f==="someday"){document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("on");});document.getElementById("tabS").classList.add("on");window._filter="all";applyView();return;}document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("on");});document.getElementById("tabA").classList.add("on");window._filter=(window._filter===f?"all":f);applyView();};' +
-'document.getElementById("bulkBtn").onclick=function(){var t=document.getElementById("bulk").value;if(!t.trim()){err("Paste the tasks first.");return;}if(busy)return;busy=true;document.getElementById("err").textContent="";google.script.run.withSuccessHandler(function(d){busy=false;document.getElementById("bulk").value="";render(d);document.getElementById("bulkMsg").textContent=d.bulkMsg||"";}).withFailureHandler(err).addBulk(t);};' +
-'google.script.run.withSuccessHandler(render).withFailureHandler(err).getData();' +
-'setInterval(function(){if(!busy)google.script.run.withSuccessHandler(render).getData();},120000);' +
-'</script></body></html>';
-// ---------- Mic button + Play button (v2.9) ----------
-var VOICE_HTML = `
+  function showSetup(msg){
+    if (setupShown) return;
+    if (!document.body){ document.addEventListener('DOMContentLoaded', function(){ showSetup(msg); }); return; }
+    setupShown = true;
+    var o = document.createElement('div');
+    o.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:999;padding:16px';
+    o.innerHTML = '<div style="background:#fff;border-radius:12px;padding:18px;max-width:420px;width:100%;font-family:Arial">' +
+      '<div style="font-weight:bold;color:#E8731C;font-size:18px;margin-bottom:6px">Ek baar setup</div>' +
+      '<div style="font-size:13px;color:#555;margin-bottom:10px">Sheet me menu <b>Sanket Tasks → Show dashboard link</b> se "Script link" aur "Passcode" milenge.</div>' +
+      (msg ? '<div style="color:#C62828;font-weight:bold;margin-bottom:8px">' + msg + '</div>' : '') +
+      '<label style="font-size:13px">Script link</label><input id="suUrl" style="width:100%;box-sizing:border-box;padding:10px;font-size:15px;margin:4px 0 10px;border:1px solid #ccc;border-radius:8px" placeholder="https://script.google.com/macros/s/.../exec">' +
+      '<label style="font-size:13px">Passcode</label><input id="suKey" inputmode="numeric" style="width:100%;box-sizing:border-box;padding:10px;font-size:15px;margin:4px 0 10px;border:1px solid #ccc;border-radius:8px">' +
+      '<label style="font-size:13px">Bolne ki bhasha</label><select id="suLang" style="width:100%;padding:10px;font-size:15px;margin:4px 0 14px;border:1px solid #ccc;border-radius:8px"><option value="mr-IN">Marathi</option><option value="hi-IN">Hindi</option></select>' +
+      '<button id="suOk" style="width:100%;background:#E8731C;color:#fff;border:0;border-radius:8px;padding:12px;font-size:16px;font-weight:bold">Save</button></div>';
+    document.body.appendChild(o);
+    document.getElementById('suUrl').value = LS.get('apiUrl');
+    document.getElementById('suKey').value = LS.get('apiKey');
+    document.getElementById('suLang').value = window.MIC_LANG;
+    document.getElementById('suOk').onclick = function(){
+      var u = document.getElementById('suUrl').value.trim(), k = document.getElementById('suKey').value.trim();
+      if (u.indexOf('https://script.google.com/') !== 0 || !k){ alert('Script link (https://script.google.com/...) aur Passcode dono daliye.'); return; }
+      LS.set('apiUrl', u); LS.set('apiKey', k); LS.set('micLang', document.getElementById('suLang').value);
+      window.MIC_LANG = document.getElementById('suLang').value;
+      document.body.removeChild(o); setupShown = false;
+      if (queue.length) flush(); else google.script.run.withSuccessHandler(function(d){ if (window.render) render(d); }).getData();
+    };
+  }
+  window.showSetup = showSetup;
+  document.addEventListener('DOMContentLoaded', function(){
+    var a = document.createElement('a'); a.href = '#'; a.textContent = '⚙ Setup';
+    a.style.cssText = 'position:fixed;right:10px;bottom:10px;font-size:12px;color:#999;background:#fff;padding:4px 8px;border-radius:8px;text-decoration:none;box-shadow:0 1px 3px rgba(0,0,0,.15)';
+    a.onclick = function(e){ e.preventDefault(); showSetup(''); };
+    document.body.appendChild(a);
+  });
+})();
+</script>
+<base target="_top"><style>body{font-family:Arial,sans-serif;margin:0;background:#FFF6EE;color:#222}.top{background:#E8731C;color:#fff;padding:14px 18px}.top h1{margin:0;font-size:22px}.top div{font-size:13px;opacity:.95}.wrap{max-width:960px;margin:0 auto;padding:14px}.kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:14px}.k{background:#fff;border-radius:10px;padding:12px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.12);cursor:pointer;transition:transform .1s}.k:hover{transform:translateY(-2px)}.k.sel{outline:3px solid #E8731C;outline-offset:-3px}.k b{display:block;font-size:28px;color:#E8731C}.k span{font-size:12px;color:#555}.k.red b{color:#C62828}.k.green b{color:#2E7D32}.card{background:#fff;border-radius:10px;padding:12px;margin-bottom:14px;box-shadow:0 1px 3px rgba(0,0,0,.12)}.card h2{margin:0 0 10px;font-size:16px;color:#E8731C}.form{display:grid;grid-template-columns:110px 1fr 54px 140px 100px 110px;gap:8px}input,select,button{font-size:14px;padding:8px;border:1px solid #ddd;border-radius:6px}button{background:#E8731C;color:#fff;border:none;cursor:pointer;font-weight:bold}button.gr{background:#2E7D32}.task{display:flex;gap:10px;border-left:6px solid #ccc;background:#fff;border-radius:8px;padding:10px;margin-bottom:8px;box-shadow:0 1px 2px rgba(0,0,0,.1)}.task.overdue{border-color:#C62828;background:#FFF0F0}.task.today{border-color:#E8731C}.task.upcoming{border-color:#1565C0}.task.open{border-color:#999}.task.done{border-color:#2E7D32;background:#F1F8F1;opacity:.85}.name{font-weight:bold;font-size:15px}.meta{font-size:12px;margin-top:4px}.tag{display:inline-block;padding:1px 7px;border-radius:9px;background:#eee;margin-right:6px}.tag.High{background:#FFCDD2}.tag.Low{background:#E0E0E0}.dates{font-size:12px;color:#555;margin-top:3px}.upd{white-space:pre-wrap;font-size:12px;background:#FFF8E1;border-radius:6px;padding:6px;margin-top:6px}.btns{display:flex;flex-direction:column;gap:6px}.dn{color:#2E7D32;font-weight:bold;text-align:right;font-size:13px}.msg{text-align:center;color:#777;padding:14px}#err{color:#C62828;font-weight:bold}.tabs{display:flex;gap:4px;margin-bottom:10px}.tab{background:#F2E1D1;color:#555;border:none;padding:10px 18px;border-radius:8px 8px 0 0;font-weight:bold;cursor:pointer}.tab.on{background:#fff;color:#E8731C;box-shadow:0 -2px 4px rgba(0,0,0,.08)}.tab span.n{background:#fff;color:#E8731C;border-radius:9px;padding:1px 7px;margin-left:6px;font-size:12px}.tab.on span.n{background:#FFF0E1}.task.someday{border-color:#8E24AA;background:#F7F0FA}button.pu{background:#8E24AA}.task.waiting{border-color:#F9A825;background:#FFFDF2}button.cp{background:#F9A825;color:#000}.pkpis{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px}.pk{background:#fff;border-radius:12px;padding:26px 12px;text-align:center;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.12);border-top:8px solid #999}.pk b{display:block;font-size:42px}.pk span{font-size:17px;font-weight:bold;color:#555}.pk[data-p=High]{border-color:#C62828}.pk[data-p=High] b{color:#C62828}.pk[data-p=Normal]{border-color:#E8731C}.pk[data-p=Normal] b{color:#E8731C}.pk[data-p=Low]{border-color:#1565C0}.pk[data-p=Low] b{color:#1565C0}.pk[data-on]{outline:3px solid #333;outline-offset:-3px}@media(max-width:700px){.kpis{grid-template-columns:repeat(2,1fr)}.form{grid-template-columns:1fr 1fr}.task{flex-direction:column}.btns{flex-direction:row}}</style></head><body><div class="top"><h1 id="ttl">Sanket – EA Tasks</h1><div id="dt">Loading...</div></div><div class="wrap"><div class="kpis" id="kpis"></div><div class="pkpis" id="pkpis"></div><div class="card"><h2>+ Add task</h2><div class="form"><select id="by"></select><input id="task" placeholder="Task"><button id="micBtn" type="button" title="Bolkar likhein">&#127908;</button><input id="due" type="date"><select id="prio"></select><button id="addBtn">Add</button></div><input type="file" id="micFile" accept="audio/*" capture style="display:none"><div id="micSt"></div><div id="micPrev"></div><div id="err"></div></div><div class="card"><h2>Paste tasks (from Claude)</h2><textarea id="bulk" rows="5" style="width:100%;box-sizing:border-box;font-size:13px;padding:8px;border:1px solid #ddd;border-radius:6px" placeholder="31-10-2026 | task | due (dd-mm-yyyy, blank = Someday) | priority"></textarea><div style="margin-top:8px"><button id="bulkBtn">Paste &amp; add</button> <span id="bulkMsg" style="margin-left:10px;font-weight:bold;color:#2E7D32"></span></div></div><div class="tabs"><button id="tabA" class="tab on" data-v="active">Active <span class="n" id="cA"></span></button><button id="tabS" class="tab" data-v="someday">Someday <span class="n" id="cS"></span></button><button id="tabD" class="tab" data-v="done">Done work <span class="n" id="cD"></span></button></div><div class="card"><div id="list"><div class="msg">Loading...</div></div></div></div><script>function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c];});}var busy=false;function err(e){busy=false;document.getElementById("err").textContent=(e&&e.message)?e.message:String(e);}function call(fn,args){if(busy)return;busy=true;document.getElementById("err").textContent="";var r=google.script.run.withSuccessHandler(function(d){busy=false;render(d);}).withFailureHandler(err);r[fn].apply(r,args);}function fill(id,arr){var s=document.getElementById(id);if(s.options.length)return;arr.forEach(function(v){var o=document.createElement("option");o.value=v;o.textContent=v;s.appendChild(o);});}function itemHtml(x){var when="";if(x.status==="overdue")when="<b style=\"color:#C62828\">OVERDUE "+(-x.days)+(x.days===-1?" day":" days")+"</b>";else if(x.status==="today")when="<b style=\"color:#E8731C\">DUE TODAY</b>";else if(x.status==="upcoming")when="due in "+x.days+(x.days===1?" day":" days");else if(x.status==="open")when="no due date";var h="<div class=\"task "+x.status+"\"><div style=\"flex:1;min-width:0\"><div class=name>"+esc(x.t)+"</div>";h+="<div class=meta><span class=tag>By "+esc(x.by)+"</span><span class=\"tag "+esc(x.prio)+"\">"+esc(x.prio)+"</span>"+when+"</div>";h+="<div class=dates>Given: <b>"+esc(x.given)+"</b> &nbsp;&middot;&nbsp; Due: <b>"+esc(x.due)+"</b></div>";if(x.completed&&!x.done)h+="<div class=upd style=\"background:#FFF8E1;color:#8D6E00;border-left-color:#F9A825\">&#10003; Completed by EA on "+esc(x.completedOn)+" &middot; waiting for Sanket PIN</div>";if(x.upd)h+="<div class=upd>"+esc(x.upd)+"</div>";h+="</div>";if(x.done)h+="<div class=dn>&#10003; Done"+(x.late?" (late)":" (on time)")+"<br><span style=\"font-weight:normal;color:#555\">"+esc(x.doneOn)+"</span></div>";else if(x.completed) h+="<div class=btns><button data-a=upd data-r="+x.row+">Update</button><button class=gr data-a=done data-r="+x.row+">Done &#10003;</button></div>";else h+="<div class=btns><button data-a=upd data-r="+x.row+">Update</button><button class=cp data-a=completed data-r="+x.row+">Completed</button><button class=gr data-a=done data-r="+x.row+">Done &#10003;</button><button class=pu data-a=someday data-r="+x.row+">Someday</button></div>";h+="</div>";return h;}function somedayHtml(x){var h="<div class=\"task someday\"><div style=\"flex:1;min-width:0\"><div class=name>"+esc(x.t)+"</div>";h+="<div class=meta><span class=tag>By "+esc(x.by)+"</span><span class=\"tag "+esc(x.prio)+"\">"+esc(x.prio)+"</span>Moved: "+esc(x.somedayOn)+"</div>";h+="<div class=dates>Given: <b>"+esc(x.given)+"</b> &nbsp;&middot;&nbsp; Due: <b>"+esc(x.due)+"</b></div>";if(x.upd)h+="<div class=upd>"+esc(x.upd)+"</div>";h+="</div>";h+="<div class=btns><button data-a=tolive data-r="+x.row+">Move to Live</button></div></div>";return h;}function applyView(){var d=window._d;if(!d)return;var tab=document.querySelector(".tab.on").getAttribute("data-v");var f=window._filter||"all";var items=[],msg="";if(tab==="done"){items=d.allDone||[];msg="No done tasks yet";}else if(tab==="someday"){items=d.someday;msg="No Someday tasks";}else if(f==="overdue"){items=d.list.filter(function(x){return x.status==="overdue";});msg="No overdue tasks";}else if(f==="today"){items=d.list.filter(function(x){return x.status==="today";});msg="No tasks due today";}else if(f==="pending"){items=d.list.filter(function(x){return !x.done;});msg="No pending tasks";}else if(f==="done"){items=d.doneList;msg="No tasks done this month";}else{items=d.list;msg="No open tasks";}if(window._prio){items=items.filter(function(x){return x.prio===window._prio;});msg="No "+window._prio+" tasks here";}var ph="";["High","Normal","Low"].forEach(function(p){var n=d.list.filter(function(x){return !x.done&&x.prio===p;}).length;ph+="<div class=pk data-p="+p+(window._prio===p?" data-on=1":"")+"><b>"+n+"</b><span>"+p+"</span></div>";});document.getElementById("pkpis").innerHTML=ph;var h="";if(!items.length)h="<div class=msg>"+msg+"</div>";else items.forEach(function(x){h+=(tab==="someday"?somedayHtml(x):itemHtml(x));});document.getElementById("list").innerHTML=h;document.querySelectorAll(".k").forEach(function(k){k.classList.remove("sel");});var sel=document.querySelector(tab==="someday"?".k[data-f=someday]":(".k[data-f=\""+f+"\"]"));if(sel)sel.classList.add("sel");}function render(d){ document.getElementById("ttl").textContent=d.title;document.getElementById("dt").textContent=d.todayLabel; document.getElementById("due").min=todayYmd(); fill("by",d.givers);fill("prio",d.prios);document.getElementById("prio").value="Normal"; document.getElementById("cA").textContent=d.list.filter(function(x){return !x.done;}).length;document.getElementById("cS").textContent=d.someday.length;document.getElementById("cD").textContent=(d.allDone||[]).length; var s=d.score,sc=(s.score===null?"-":s.score+"%"); document.getElementById("kpis").innerHTML=  "<div class=\"k sel\" data-f=pending><b>"+d.c.pending+"</b><span>Pending</span></div>"+  "<div class=\"k red\" data-f=overdue><b>"+d.c.overdue+"</b><span>Overdue</span></div>"+  "<div class=k data-f=today><b>"+d.c.today+"</b><span>Due today</span></div>"+  "<div class=\"k green\" data-f=done><b>"+d.c.doneMonth+"</b><span>Done this month</span></div>"+  "<div class=k data-f=someday><b>"+d.c.someday+"</b><span>Someday</span></div>"+  "<div class=k><b>"+sc+"</b><span>EA score "+esc(d.monthLabel)+"<br>On time "+s.ontime+" · Late "+s.late+" · Overdue "+s.overdue+"</span></div>"; window._d=d; applyView();}document.getElementById("addBtn").onclick=function(){var t=document.getElementById("task").value.trim();if(!t){err("Please write the task.");return;}var dv=document.getElementById("due").value;if(dv&&dv<todayYmd()){err("Due date cannot be before today. Please choose today or a later date.");alert("Due date cannot be before today.");return;} call("addTask",[document.getElementById("by").value,t,document.getElementById("due").value,document.getElementById("prio").value]); document.getElementById("task").value="";document.getElementById("due").value="";};function todayYmd(){var d=new Date();return d.getFullYear()+"-"+("0"+(d.getMonth()+1)).slice(-2)+"-"+("0"+d.getDate()).slice(-2);}function pickDate(r){var o=document.createElement("div");o.style.cssText="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:99";var b=document.createElement("div");b.style.cssText="background:#fff;padding:20px;border-radius:12px;width:290px;font-family:Arial";var t=document.createElement("div");t.textContent="Move to Live - select new due date (optional)";t.style.cssText="font-weight:bold;margin-bottom:12px;color:#E8731C";var i=document.createElement("input");i.type="date";i.min=todayYmd();i.style.cssText="width:100%;padding:10px;font-size:16px;box-sizing:border-box;margin-bottom:14px";var ok=document.createElement("button");ok.textContent="Move to Live";var no=document.createElement("button");no.textContent="Cancel";no.style.cssText="background:#999;margin-left:8px";ok.onclick=function(){if(i.value&&i.value<todayYmd()){alert("Due date cannot be before today. Please choose today or a later date.");return;}document.body.removeChild(o);call("toLiveTask",[r,i.value||""]);};no.onclick=function(){document.body.removeChild(o);};b.appendChild(t);b.appendChild(i);b.appendChild(ok);b.appendChild(no);o.appendChild(b);document.body.appendChild(o);setTimeout(function(){try{i.focus();if(i.showPicker)i.showPicker();}catch(e){}},50);}document.getElementById("list").onclick=function(e){var b=e.target.closest("button");if(!b)return;var r=Number(b.getAttribute("data-r"));var a=b.getAttribute("data-a"); if(a==="upd"){var u=prompt("Write the update for this task:");if(u&&u.trim())call("updateTask",[r,u.trim()]);} else if(a==="someday"){if(confirm("Move this task to Someday?"))call("somedayTask",[r]);} else if(a==="completed"){if(confirm("Mark this task Completed? Sanket will confirm with PIN."))call("completedTask",[r]);} else if(a==="tolive"){pickDate(r);} else{var p=prompt("Enter PIN to mark Done:");if(p)call("doneTask",[r,p]);}};document.querySelectorAll(".tab").forEach(function(t){t.onclick=function(){document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("on");});t.classList.add("on");if(t.getAttribute("data-v")!=="someday")window._filter="all";applyView();};});document.getElementById("pkpis").onclick=function(e){var k=e.target.closest(".pk");if(!k)return;var p=k.getAttribute("data-p");window._prio=(window._prio===p?"":p);applyView();};document.getElementById("kpis").onclick=function(e){var k=e.target.closest(".k");if(!k||!k.hasAttribute("data-f"))return;var f=k.getAttribute("data-f");if(f==="someday"){document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("on");});document.getElementById("tabS").classList.add("on");window._filter="all";applyView();return;}document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("on");});document.getElementById("tabA").classList.add("on");window._filter=(window._filter===f?"all":f);applyView();};document.getElementById("bulkBtn").onclick=function(){var t=document.getElementById("bulk").value;if(!t.trim()){err("Paste the tasks first.");return;}if(busy)return;busy=true;document.getElementById("err").textContent="";google.script.run.withSuccessHandler(function(d){busy=false;document.getElementById("bulk").value="";render(d);document.getElementById("bulkMsg").textContent=d.bulkMsg||"";}).withFailureHandler(err).addBulk(t);};google.script.run.withSuccessHandler(render).withFailureHandler(err).getData();setInterval(function(){if(!busy)google.script.run.withSuccessHandler(render).getData();},120000);</script>
 <style>
 #micBtn{background:#1565C0;font-size:20px;padding:4px}
 #micBtn.rec{background:#C62828;animation:micp 1s infinite}
@@ -598,9 +210,9 @@ var VOICE_HTML = `
     fr.onload = function(){
       var url = String(fr.result);
       window._voice = { b64: url.split(',')[1], mime: f.type || 'audio/mp4' };
-      prev.innerHTML = '<audio controls class=vaud src="' + url + '"></audio><a href="#" id="micDel" style="font-size:12px;color:#C62828">\u2716 Ye aawaz hatao</a>';
+      prev.innerHTML = '<audio controls class=vaud src="' + url + '"></audio><a href="#" id="micDel" style="font-size:12px;color:#C62828">✖ Ye aawaz hatao</a>';
       document.getElementById('micDel').onclick = function(e){ e.preventDefault(); clearVoice(); say(''); };
-      say('\u2714 Aawaz tayyar (\u25B6 se sun sakte hain). Ab Task ke khane me keyboard ke mic se likhiye, phir Add dabaiye.', '#2E7D32');
+      say('✔ Aawaz tayyar (▶ se sun sakte hain). Ab Task ke khane me keyboard ke mic se likhiye, phir Add dabaiye.', '#2E7D32');
       setTimeout(function(){ try { box.focus(); } catch(e){} }, 300);
     };
     fr.onerror = function(){ say('Aawaz load nahi hui.', '#C62828'); };
@@ -608,7 +220,7 @@ var VOICE_HTML = `
   };
   mic.onclick = function(){
     if (on){ stopAll(); return; }
-    if (mode() === 'recorder'){ clearVoice(); say('Recorder khul raha hai... bolkar Save / \u2714 dabaiye.', '#1565C0'); mf.click(); return; }
+    if (mode() === 'recorder'){ clearVoice(); say('Recorder khul raha hai... bolkar Save / ✔ dabaiye.', '#1565C0'); mf.click(); return; }
     window._voice = null; on = true;
     mic.classList.add('rec'); mic.innerHTML = '&#9209;';
     say('Boliye... khatam ho to ⏹ dabaiye', '#C62828');
@@ -637,7 +249,7 @@ var VOICE_HTML = `
   function addHot(h, x){
     if (x.done || x.prio !== 'High' || (x.status !== 'overdue' && x.status !== 'today')) return h;
     h = h.replace('<div class="task ', '<div class="task hot ');
-    return h.replace('<div class=meta>', '<div class=meta><span class=hotb>\uD83D\uDD25 ' + (x.status === 'overdue' ? 'URGENT \u2013 late' : 'URGENT \u2013 aaj') + '</span>');
+    return h.replace('<div class=meta>', '<div class=meta><span class=hotb>🔥 ' + (x.status === 'overdue' ? 'URGENT – late' : 'URGENT – aaj') + '</span>');
   }
   itemHtml = function(x){ return addHot(addPlay(_ih(x), x), x); };
   somedayHtml = function(x){ return addPlay(_sh(x), x); };
@@ -661,4 +273,4 @@ var VOICE_HTML = `
   if (window._d) applyView();
 })();
 </script>
-`;
+</body></html>
